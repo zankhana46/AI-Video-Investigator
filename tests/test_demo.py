@@ -89,29 +89,41 @@ def test_clips_and_discovery():
 def _fake_gradio():
     """Just enough of gradio's API to build the app and call its callbacks."""
     g = types.ModuleType("gradio")
-    calls = {}
+    handlers = {}
+
+    class Dep:
+        def then(self, fn, inputs=None, outputs=None):
+            handlers[fn.__name__ + "_then"] = fn
+            return Dep()
 
     class C:
         def __init__(self, *a, **k): self.kw = k
         def __enter__(self): return self
         def __exit__(self, *a): return False
-        def click(self, fn, inputs, outputs): calls[id(self)] = (fn, inputs, outputs)
-        submit = click
+        def _on(self, fn, inputs=None, outputs=None):
+            handlers[fn.__name__] = fn
+            return Dep()
+        click = submit = change = select = _on
     for name in ("Blocks", "Row", "Column", "Markdown", "State", "Video", "Dropdown", "Button", "Textbox",
-                 "Plot", "Dataframe"):
+                 "Plot", "Dataframe", "Radio", "HTML", "Accordion"):
         setattr(g, name, C)
     g.update = lambda **k: k
-    return g, calls
+    g.Progress = lambda *a, **k: (lambda f, desc=None: None)
+    g.SelectData = object
+    g.themes = types.SimpleNamespace(Soft=lambda **k: "soft-theme")
+    return g, handlers
 
 
 def test_app_wiring():
-    g, calls = _fake_gradio()
+    g, h = _fake_gradio()
     sys.modules["gradio"] = g
 
     class FakeSearch:
-        def index(self, path):
-            return {"path": path, "duration": 20.0, "siglip": np.zeros((20, 4)), "starts": np.arange(17),
-                    "timing": {"total_s": 1.0, "frame_s": 0.4, "activity_s": 0.6}}
+        cfg = demo.load_final_config(None)
+
+        def index(self, path, progress=None):
+            progress and progress(0.5, "half")
+            return {"path": path, "duration": 20.0, "timing": {"total_s": 1.0}}
 
         def search(self, idx, q):
             s = np.sin(np.arange(20)); a = np.cos(np.arange(20))
@@ -123,17 +135,25 @@ def test_app_wiring():
         if not _video(vid):
             print("SKIP app wiring (no mp4 encoder)")
             return
-        ex = [{"label": "example", "path": str(vid), "queries": ["a person opens the door"]}]
-        demo.build_app(FakeSearch(), ex, {(str(vid), "a person opens the door"): (2.0, 5.0)})
-        fns = [v[0] for v in calls.values()]
-        do_index, do_search = fns[0], fns[1]
-        idx, msg, upd = do_index(None, "example")
-        assert idx["path"] == str(vid) and "Indexed" in msg and upd["value"] == "a person opens the door"
-        out = do_search(idx, "a person opens the door")
-        assert len(out) == 3 + fu.K and "IoU" in out[1] and out[3] == "c1.mp4" and out[5] is None
-        assert "Index a video first" in do_search(None, "x")[1]
+        ex = [{"label": "example", "path": str(vid), "queries": ["a person opens the door", "person sits"]}]
+        app = demo.build_app(FakeSearch(), ex, {demo.gt_key(vid, "a person opens the door"): (2.0, 5.0)})
+        assert h["pick_example"]("example") == str(vid)
+        # Gradio copies files into its cache: same file name, different folder
+        cached = Path(d) / "cache"; cached.mkdir(); shutil.copy(vid, cached / "AAAAA.mp4")
+        idx, msg, sugg, q = h["on_video"](str(cached / "AAAAA.mp4"))
+        assert "Ready" in msg and sugg["choices"][0] == "a person opens the door" and q["value"] == ""
+        assert h["use_suggestion"](types.SimpleNamespace(value="person sits")) == "person sits"
+        fig, info, cards, moment, player, clips = h["do_search"](idx, str(cached / "AAAAA.mp4"), "a person opens the door")
+        assert "Ground truth" in info and "IoU with ground truth" in cards and "vi-card top" in cards
+        assert moment["value"].startswith("#1") and player == "c1.mp4" and clips == ["c1.mp4", "c2.mp4"]
+        assert h["play_moment"](moment["choices"][1], clips) == "c2.mp4"
+        assert "first" in h["do_search"](None, None, "x")[1]
+        assert "Type what" in h["do_search"](idx, str(vid), " ")[1]
+        assert "Pick an example" in h["on_video"](None)[1]
+        assert "do_search_then" in h
+        assert hasattr(app, "_vi_launch_kw")
     del sys.modules["gradio"]
-    print("PASS app wiring (stand-in gradio)")
+    print("PASS app wiring (stand-in gradio): auto-index, suggestions, search, moment player")
 
 
 if __name__ == "__main__":

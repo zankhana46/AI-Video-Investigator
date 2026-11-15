@@ -120,26 +120,38 @@ def cut_clips(video_path, segments, out_dir, pad=0.0):
     return paths
 
 
-def plot_search(s, a, f, segs, scores, query, gt=None):
-    """s(t), a(t), f(t) with the top moments shaded; GT in green when known."""
+def plot_search(s, a, f, segs, scores, query, gt=None, transparent=False):
+    """s(t), a(t), f(t) with the top moments as bars; GT in green when known.
+    transparent=True blends into light and dark app themes."""
     from matplotlib.figure import Figure          # no pyplot: no global state, works in any backend
     s, a = cv.align(s, a)
     t = np.arange(len(f)) + 0.5
     fig = Figure(figsize=(10, 3.2))
     ax = fig.subplots()
+    fused_col, label_col = ("#8b5cf6", "#ef4444") if transparent else ("black", "darkred")  # readable on dark & light
     if gt is not None:
-        ax.axvspan(gt[0], gt[1], color="green", alpha=0.2, label="ground truth")
+        ax.axvspan(gt[0], gt[1], color="#22c55e" if transparent else "green", alpha=0.28 if transparent else 0.2,
+                   label="ground truth")
     for i, (x0, x1) in enumerate(segs):                       # top moments as stacked bars, #1 on top
         y = 3.6 - 0.35 * i
         ax.plot([x0, x1], [y, y], color="red" if i == 0 else "salmon", lw=5 if i == 0 else 3,
                 solid_capstyle="butt", label="top moment" if i == 0 else None)
-        ax.text(x1 + 0.2, y, f"#{i + 1}", va="center", fontsize=7, color="darkred")
+        ax.text(x1 + 0.2, y, f"#{i + 1}", va="center", fontsize=7, color=label_col)
     ax.plot(t, cv.zscore(s), color="tab:blue", alpha=0.7, label="frame s(t), SigLIP")
     ax.plot(t, cv.zscore(a), color="tab:orange", alpha=0.7, label="activity a(t), X-CLIP")
-    ax.plot(t, cv.zscore(f), color="black", lw=2, label="fused f(t)")
+    ax.plot(t, cv.zscore(f), color=fused_col, lw=2.2, label="fused f(t)")
     ax.set_ylim(-3, 4); ax.set_xlabel("seconds"); ax.set_ylabel("z-score")
     ax.set_title(f"\u201c{query}\u201d", fontsize=10)
-    ax.legend(fontsize=7, loc="lower right", ncol=4)
+    leg = ax.legend(fontsize=7, loc="lower right", ncol=5, frameon=not transparent)
+    if transparent:
+        grey = "#8b949e"
+        fig.patch.set_alpha(0); ax.set_facecolor("none")
+        for sp in ax.spines.values():
+            sp.set_color(grey)
+        ax.tick_params(colors=grey); ax.xaxis.label.set_color(grey); ax.yaxis.label.set_color(grey)
+        ax.title.set_color(grey); ax.grid(alpha=0.15)
+        for txt in leg.get_texts():
+            txt.set_color(grey)
     fig.tight_layout()
     return fig
 
@@ -203,20 +215,36 @@ class VideoSearch:
     def __init__(self, cfg, frame_encoder, xclip_scorer, clip_dir="/tmp/demo_clips"):
         self.cfg, self.fe, self.xs, self.clip_dir = cfg, frame_encoder, xclip_scorer, Path(clip_dir)
 
-    def index(self, path):
+    def index(self, path, progress=None):
+        """Embed a video with both models. Cached per file, so re-picking a video is instant.
+        progress: optional callable(fraction, description)."""
+        p = Path(path)
+        key = (str(p.resolve()), p.stat().st_size, p.stat().st_mtime) if p.exists() else str(path)
+        cache = self.__dict__.setdefault("_cache", {})
+        if key in cache:
+            return cache[key]
+        say = progress or (lambda f, d: None)
         t0 = time.time()
+        say(0.05, "Reading frames")
         frames, _, duration = st.decode_1fps(path)
+        say(0.25, "Frame evidence (SigLIP)")
         siglip = self.fe.encode_frames(frames)
         t1 = time.time()
+        say(0.45, "Activity evidence (X-CLIP)")
         v = xf.load_video_clips(path, self.xs.frames_per_clip, self.cfg["clip_sec"], 1.0, self.xs.size)
         emb, _ = self.xs.score_video(v["frames"], v["idx"], [])
         emb = emb / np.maximum(np.linalg.norm(emb, axis=1, keepdims=True), 1e-8)
         t2 = time.time()
-        return {"path": str(path), "duration": float(duration), "n_sec": int(v["n_sec"]),
+        say(1.0, "Ready")
+        idx = {"path": str(path), "duration": float(duration), "n_sec": int(v["n_sec"]),
                 "siglip": siglip, "xclip": emb, "starts": v["starts"],
                 "timing": {"frame_s": round(t1 - t0, 2), "activity_s": round(t2 - t1, 2),
                            "total_s": round(t2 - t0, 2),
                            "s_per_video_minute": round((t2 - t0) / max(duration / 60, 1e-9), 2)}}
+        if len(cache) >= 12:
+            cache.pop(next(iter(cache)))
+        cache[key] = idx
+        return idx
 
     def curves(self, idx, query):
         s = idx["siglip"] @ self.fe.encode_text([query])[0]
@@ -272,75 +300,180 @@ def find_extra_videos(root, exclude_dir=None, limit=8, max_minutes=10):
 
 
 # --------------------------------------------------------------------------- app
+CSS = """
+.gradio-container {max-width: 1180px !important; margin: auto !important;}
+#vi-header h1 {margin-bottom: 0.1em;}
+#vi-header p {opacity: 0.75; margin-top: 0;}
+.vi-card {border: 1px solid var(--border-color-primary); border-radius: 10px; padding: 9px 14px;
+          margin-bottom: 7px; display: flex; justify-content: space-between; align-items: center;
+          background: var(--block-background-fill);}
+.vi-card.top {border-left: 5px solid var(--color-accent);}
+.vi-card .meta {opacity: 0.7; font-size: 0.9em;}
+.vi-empty {opacity: 0.6; padding: 12px 2px;}
+"""
+
+
+def gt_key(path, query):
+    """Ground truth is looked up by file name, so it survives Gradio copying files to its cache."""
+    return (Path(str(path)).name, str(query).strip().lower())
+
+
+def result_cards(segs, scores, gt=None):
+    """HTML cards for the top moments (theme-aware colours)."""
+    if not segs:
+        return "<div class='vi-empty'>No moments found.</div>"
+    out = []
+    for i, ((x0, x1), sc) in enumerate(zip(segs, scores)):
+        iou = ""
+        if gt is not None:
+            v = fu.iou_array(np.array([[[x0, x1]]]), np.array([gt]))[0, 0]
+            iou = f" &middot; IoU with ground truth {v:.2f}"
+        out.append(f"<div class='vi-card{' top' if i == 0 else ''}'><span><b>#{i + 1}</b>&nbsp;&nbsp;"
+                   f"{x0:.1f} – {x1:.1f} s <span class='meta'>({x1 - x0:.1f} s)</span></span>"
+                   f"<span class='meta'>score {sc:+.2f}{iou}</span></div>")
+    return "".join(out)
+
+
+def _make(cls, required, optional):
+    """Create a component with optional styling arguments, dropping them on older/newer Gradio."""
+    try:
+        return cls(**required, **optional)
+    except TypeError:
+        return cls(**required)
+
+
 def build_app(searcher, examples, gt_lookup=None, max_minutes=15):
-    """examples: list of {"label", "path", "queries"}; gt_lookup: {(path, query): (start, end)}."""
+    """examples: [{"label", "path", "queries"}]; gt_lookup: {gt_key(path, query): (start, end)}."""
     import gradio as gr
     gt_lookup = gt_lookup or {}
     by_label = {e["label"]: e for e in examples}
+    by_name = {Path(e["path"]).name: e for e in examples}
+    cfg = searcher.cfg
+    K = fu.K
 
     def _path(v):
         if isinstance(v, dict):
             v = v.get("video") or v.get("path") or v.get("name")
-        return v
+        return str(v) if v else None
 
-    def do_index(upload, choice):
-        path = _path(upload) or (by_label[choice]["path"] if choice in by_label else None)
+    def pick_example(label):
+        e = by_label.get(label)
+        return e["path"] if e else gr.update()
+
+    def on_video(video, progress=gr.Progress()):
+        path = _path(video)
         if not path:
-            return None, "Upload a video or pick an example first.", gr.update()
-        cap = cv2.VideoCapture(str(path))
+            return None, "Pick an example or upload a video to begin.", gr.update(choices=[], value=None), gr.update()
+        cap = cv2.VideoCapture(path)
         fps, n = cap.get(cv2.CAP_PROP_FPS) or 0, cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
         cap.release()
         if fps <= 0 or n <= 0:
-            return None, "Could not read that video.", gr.update()
+            return None, "**Could not read that video.** Try an .mp4 file.", gr.update(choices=[], value=None), gr.update()
         if n / fps > 60 * max_minutes:
-            return None, f"Please use a video shorter than {max_minutes} minutes.", gr.update()
-        idx = searcher.index(path)
+            return (None, f"**That video is {n / fps / 60:.0f} minutes long.** Please use one under {max_minutes} minutes.",
+                    gr.update(choices=[], value=None), gr.update())
+        idx = searcher.index(path, progress=lambda f, d: progress(f, desc=d))
         tm = idx["timing"]
-        msg = (f"Indexed **{Path(path).name}**: {idx['duration']:.0f} s of video, {len(idx['siglip'])} frames, "
-               f"{len(idx['starts'])} clips in {tm['total_s']} s "
-               f"({tm['frame_s']} s SigLIP + {tm['activity_s']} s X-CLIP).")
-        sugg = by_label[choice]["queries"] if (not _path(upload) and choice in by_label) else GENERIC
-        return idx, msg, gr.update(value=sugg[0] if sugg else "")
+        ex = by_name.get(Path(path).name)
+        sugg = (ex["queries"] if ex else GENERIC)[:6]
+        msg = (f"**Ready:** {Path(path).name} &middot; {idx['duration']:.0f} s of video &middot; "
+               f"indexed in {tm['total_s']} s. Type a query or click a suggestion.")
+        return idx, msg, gr.update(choices=sugg, value=None), gr.update(value="")
 
-    def do_search(idx, query):
-        empty = [None] * fu.K
-        if idx is None:
-            return [None, "Index a video first.", None] + empty
-        if not query or not query.strip():
-            return [None, "Type what you are looking for.", None] + empty
-        res = searcher.search(idx, query.strip())
-        gt = gt_lookup.get((idx["path"], query.strip().lower()))
-        fig = plot_search(res["s"], res["a"], res["f"], res["segments"], res["scores"], query, gt)
-        rows = [[i + 1, f"{x0:.1f}", f"{x1:.1f}", f"{x1 - x0:.1f}", sc]
-                for i, ((x0, x1), sc) in enumerate(zip(res["segments"], res["scores"]))]
-        msg = f"Found {len(rows)} moments in {res['query_ms']} ms."
+    def use_suggestion(evt: gr.SelectData):
+        return evt.value
+
+    def do_search(idx, video, query, progress=gr.Progress()):
+        path = _path(video)
+        blank = (None, "", "<div class='vi-empty'>Results will appear here.</div>",
+                 gr.update(choices=[], value=None), None, [])
+        if not path:
+            return (None, "Pick an example or upload a video first.") + blank[2:]
+        if not query or not str(query).strip():
+            return (None, "Type what you are looking for, or click a suggestion.") + blank[2:]
+        if idx is None or Path(idx["path"]).name != Path(path).name:
+            idx = searcher.index(path, progress=lambda f, d: progress(f, desc=d))
+        q = str(query).strip()
+        res = searcher.search(idx, q)
+        gt = gt_lookup.get(gt_key(path, q))
+        fig = plot_search(res["s"], res["a"], res["f"], res["segments"], res["scores"], q, gt, transparent=True)
+        msg = f"Found {len(res['segments'])} moments in {res['query_ms']:.0f} ms."
         if gt is not None:
-            iou = fu.iou_array(np.array([[res["segments"][0]]]), np.array([gt]))[0, 0] if rows else 0.0
-            msg += f" Ground truth: {gt[0]:.1f}–{gt[1]:.1f} s, IoU of the top moment = {iou:.2f}."
-        clips = (res["clips"] + empty)[:fu.K]
-        return [fig, msg, rows] + clips
+            msg += f" Ground truth (green): {gt[0]:.1f} – {gt[1]:.1f} s."
+        names = [f"#{i + 1}  {x0:.1f}–{x1:.1f} s" for i, (x0, x1) in enumerate(res["segments"])]
+        clips = res["clips"]
+        return (fig, msg, result_cards(res["segments"], res["scores"], gt),
+                gr.update(choices=names, value=names[0] if names else None),
+                clips[0] if clips else None, clips)
 
-    with gr.Blocks(title="AI Video Investigator") as app:
-        gr.Markdown("# AI Video Investigator\nFind the moment in a video that matches a description. "
-                    "Frame evidence (SigLIP) and activity evidence (X-CLIP) are fused as in the report.")
-        state = gr.State(None)
+    def play_moment(choice, clips):
+        if not choice or not clips:
+            return gr.update()
+        i = int(choice.split()[0].lstrip("#")) - 1
+        return clips[i] if 0 <= i < len(clips) else gr.update()
+
+    theme = None
+    try:
+        theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="sky", neutral_hue="slate")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        app_ctx = gr.Blocks(title="AI Video Investigator", theme=theme, css=CSS)
+        launch_kw = {}
+    except TypeError:                               # newer Gradio: theme and css go to launch()
+        app_ctx = gr.Blocks(title="AI Video Investigator")
+        launch_kw = {"theme": theme, "css": CSS}
+
+    with app_ctx as app:
+        gr.Markdown("# AI Video Investigator\nDescribe a moment in plain words and find where it happens in a video.",
+                    elem_id="vi-header")
+        idx_state, clips_state = gr.State(None), gr.State([])
         with gr.Row():
-            upload = gr.Video(label="Upload a video")
-            with gr.Column():
-                choice = gr.Dropdown(choices=list(by_label), label="…or pick an example",
-                                     value=next(iter(by_label), None))
-                index_btn = gr.Button("1. Index video", variant="primary")
-                status = gr.Markdown()
+            with gr.Column(scale=5):
+                choice = gr.Dropdown(choices=list(by_label), value=None, label="Pick an example video")
+                video = _make(gr.Video, {"label": "…or upload your own (up to %d min)" % max_minutes},
+                              {"height": 300})
+                status = gr.Markdown("Pick an example or upload a video to begin.")
+            with gr.Column(scale=6):
+                query = _make(gr.Textbox, {"label": "What are you looking for?"},
+                              {"placeholder": "e.g. a person opens the door", "lines": 1})
+                with gr.Row():
+                    search_btn = _make(gr.Button, {"value": "Search"}, {"variant": "primary"})
+                suggestions = gr.Radio(choices=[], value=None, label="Suggestions (click to search)")
+                info = gr.Markdown()
+                cards = gr.HTML("<div class='vi-empty'>Results will appear here.</div>")
         with gr.Row():
-            query = gr.Textbox(label="2. What are you looking for?", placeholder="a person opens the door",
-                               scale=4)
-            search_btn = gr.Button("Search", variant="primary", scale=1)
-        info = gr.Markdown()
-        plot = gr.Plot(label="Evidence over time")
-        table = gr.Dataframe(headers=["rank", "start (s)", "end (s)", "length (s)", "score"], label="Top moments")
-        with gr.Row():
-            vids = [gr.Video(label=f"#{i + 1}") for i in range(fu.K)]
-        index_btn.click(do_index, [upload, choice], [state, status, query])
-        search_btn.click(do_search, [state, query], [plot, info, table] + vids)
-        query.submit(do_search, [state, query], [plot, info, table] + vids)
+            with gr.Column(scale=6):
+                plot = gr.Plot(label="Evidence over time")
+            with gr.Column(scale=5):
+                moment = gr.Radio(choices=[], value=None, label="Play moment")
+                player = _make(gr.Video, {"label": "Selected moment"}, {"interactive": False, "autoplay": True,
+                                                                         "height": 300})
+        with gr.Accordion("How it works", open=False):
+            gr.Markdown(
+                f"Each video is indexed once: **SigLIP** embeds one frame per second (what is visible) and "
+                f"**X-CLIP** embeds {cfg['clip_sec']:.0f}-second clips (what is happening). For a query, both give a "
+                f"score over time; they are standardised and mixed as *f(t) = α·frame + (1 − α)·activity* "
+                f"(α = {cfg['alpha_top1']} for the top moment, {cfg['alpha_ranks_2_5']} for ranks 2–5), the values "
+                f"chosen on the validation set in the report. The top moment comes from thresholding f(t); "
+                f"the alternatives come from multi-scale sliding windows.")
+
+        search_outputs = [plot, info, cards, moment, player, clips_state]
+        choice.change(pick_example, [choice], [video])
+        video.change(on_video, [video], [idx_state, status, suggestions, query])
+        suggestions.select(use_suggestion, None, [query]).then(
+            do_search, [idx_state, video, query], search_outputs)
+        search_btn.click(do_search, [idx_state, video, query], search_outputs)
+        query.submit(do_search, [idx_state, video, query], search_outputs)
+        moment.change(play_moment, [moment, clips_state], [player])
+    app._vi_launch_kw = launch_kw
     return app
+
+
+def launch_app(app, **kw):
+    """Launch, passing theme/css here when this Gradio version wants them at launch time."""
+    extra = getattr(app, "_vi_launch_kw", {})
+    try:
+        return app.launch(**extra, **kw)
+    except TypeError:
+        return app.launch(**kw)
